@@ -1,0 +1,7 @@
+# docker-compose.yml
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"    # porta AMQP
+      - "15672:15672"  # painel web de gerenciamento

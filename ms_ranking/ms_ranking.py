@@ -1,48 +1,78 @@
+"""
+TRABALHO 1 - MICROSSERVIÇOS, MENSAGERIA E CRIPTOGRAFIA ASSIMÉTRICA
+BSI
+Disciplina: Sistemas Distribuídos
+Professora: Ana Cristina Barreiras Kochem Vendramin
+
+Aluno: Vitor Chiuco Zeni
+
+MS Ranking: contabiliza os votos e publica as promoções em destaque (hot deal).
+"""
+
 import pika
 import json
 import sys
 import os
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, project_root)
-os.chdir(project_root)
+# Permite importar o crypto_utils da raiz do projeto
+raiz_projeto = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, raiz_projeto)
+os.chdir(raiz_projeto)
 
 from crypto_utils import (carregar_chave_privada, carregar_chave_publica,
                           criar_evento, validar_evento)
 
+# --- Configurações ---
 EXCHANGE = 'Promocoes'
-HOT_DEAL_THRESHOLD = 3  # score mínimo (votos positivos - negativos) para virar destaque
+FILA = 'Fila_Ranking'
+HOT_DEAL_THRESHOLD = 3      # Score mínimo (positivos - negativos) para virar destaque
 
 chave_publica_gateway = carregar_chave_publica('keys/gateway/public.pem')
 chave_privada_ranking = carregar_chave_privada('keys/ranking/private.pem')
 
-# Estado local: promocao_id -> {positivos, negativos, titulo, descricao, categoria, preco, loja, hot_deal}
+# Votos por promoção: promocao_id -> {positivos, negativos, dados da promoção, hot_deal}
 votos = {}
 
+# --- Processamento dos votos ---
 
-def callback(ch, method, properties, body):
+def publicar_destaque(ch, promocao_id, dados, score):
+    """Assina e publica o evento promocao.destaque."""
+    payload = {
+        'promocao_id': promocao_id,
+        'titulo':      dados['titulo'],
+        'descricao':   dados['descricao'],
+        'categoria':   dados['categoria'],
+        'preco':       dados['preco'],
+        'loja':        dados['loja'],
+        'score':       score,
+    }
+    evento = criar_evento('promocao.destaque', payload, chave_privada_ranking)
+    ch.basic_publish(exchange=EXCHANGE, routing_key='promocao.destaque', body=json.dumps(evento))
+    print(f'[Ranking] 🔥 HOT DEAL publicado: "{dados["titulo"]}" (score {score})')
+
+def processar_voto(ch, method, properties, body):
     try:
         try:
             evento = json.loads(body)
         except Exception:
-            print('[Ranking] Mensagem malformada (JSON inválido) — descartada.')
+            print('[Ranking] Mensagem com JSON inválido descartada.')
             return
 
-        # 1. Verifica assinatura digital com a chave pública do Gateway.
+        # 1. Valida a assinatura do Gateway
         payload, erro = validar_evento(evento, chave_publica_gateway)
         if erro:
-            print(f'[Ranking] Evento descartado — {erro}.')
+            print(f'[Ranking] Evento descartado: {erro}.')
             return
 
-        pid  = payload.get('promocao_id')
+        promocao_id = payload.get('promocao_id')
         voto = payload.get('voto')
-        if not pid or voto not in ('positivo', 'negativo'):
-            print('[Ranking] Evento descartado — voto ou promocao_id inválido.')
+        if not promocao_id or voto not in ('positivo', 'negativo'):
+            print('[Ranking] Evento descartado: voto ou promocao_id inválido.')
             return
 
-        # 2. Atualiza o contador de votos da promoção.
-        if pid not in votos:
-            votos[pid] = {
+        # 2. Atualiza o contador de votos
+        if promocao_id not in votos:
+            votos[promocao_id] = {
                 'positivos': 0,
                 'negativos': 0,
                 'titulo':    payload.get('titulo', 'Sem título'),
@@ -53,52 +83,41 @@ def callback(ch, method, properties, body):
                 'hot_deal':  False,
             }
 
+        dados = votos[promocao_id]
         if voto == 'positivo':
-            votos[pid]['positivos'] += 1
+            dados['positivos'] += 1
         else:
-            votos[pid]['negativos'] += 1
+            dados['negativos'] += 1
 
-        # 3. Recalcula o score de popularidade.
-        p = votos[pid]
-        score = p['positivos'] - p['negativos']
-        print(f'[Ranking] "{p["titulo"]}" — +{p["positivos"]} / -{p["negativos"]} (score: {score})')
+        # 3. Recalcula o score
+        score = dados['positivos'] - dados['negativos']
+        print(f'[Ranking] "{dados["titulo"]}": +{dados["positivos"]} / -{dados["negativos"]} (score: {score})')
 
-        # 4. Publica destaque apenas na primeira vez que atinge o limiar.
-        if score >= HOT_DEAL_THRESHOLD and not p['hot_deal']:
-            p['hot_deal'] = True
-            hot_payload = {
-                'promocao_id': pid,
-                'titulo':      p['titulo'],
-                'descricao':   p['descricao'],
-                'categoria':   p['categoria'],
-                'preco':       p['preco'],
-                'loja':        p['loja'],
-                'score':       score,
-            }
-            hot_evento = criar_evento('promocao.destaque', hot_payload, chave_privada_ranking)
-            ch.basic_publish(
-                exchange=EXCHANGE,
-                routing_key='promocao.destaque',
-                body=json.dumps(hot_evento),
-            )
-            print(f'[Ranking] 🔥 HOT DEAL publicado: "{p["titulo"]}" (score {score})')
+        # 4. Publica o destaque só na primeira vez que atinge o limite
+        if score >= HOT_DEAL_THRESHOLD and not dados['hot_deal']:
+            dados['hot_deal'] = True
+            publicar_destaque(ch, promocao_id, dados, score)
+
     except Exception as e:
-        # Nenhuma mensagem inesperada pode derrubar o microsserviço.
-        print(f'[Ranking] Erro ao processar evento — descartado: {e}')
+        print(f'[Ranking] Erro ao processar evento: {e}')
 
+# --- Função principal ---
 
-connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
-channel = connection.channel()
+def main():
+    conexao = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+    canal = conexao.channel()
 
-channel.exchange_declare(exchange=EXCHANGE, exchange_type='topic')
-channel.queue_declare(queue='Fila_Ranking', durable=True)
-channel.queue_bind(exchange=EXCHANGE, queue='Fila_Ranking', routing_key='promocao.voto')
+    canal.exchange_declare(exchange=EXCHANGE, exchange_type='topic')
+    canal.queue_declare(queue=FILA, durable=True)
+    canal.queue_bind(exchange=EXCHANGE, queue=FILA, routing_key='promocao.voto')
+    canal.basic_consume(queue=FILA, on_message_callback=processar_voto, auto_ack=True)
 
-channel.basic_consume(queue='Fila_Ranking', on_message_callback=callback, auto_ack=True)
+    print(f'[Ranking] Aguardando votos em "promocao.voto" (limite hot deal = {HOT_DEAL_THRESHOLD})...')
+    try:
+        canal.start_consuming()
+    except KeyboardInterrupt:
+        print('\n[Ranking] Encerrando...')
+        conexao.close()
 
-print(f'[Ranking] Aguardando votos em "promocao.voto" (hot deal threshold = {HOT_DEAL_THRESHOLD})...')
-try:
-    channel.start_consuming()
-except KeyboardInterrupt:
-    print('\n[Ranking] Encerrando...')
-    connection.close()
+if __name__ == '__main__':
+    main()

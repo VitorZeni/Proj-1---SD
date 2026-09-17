@@ -1,3 +1,14 @@
+"""
+TRABALHO 1 - MICROSSERVIÇOS, MENSAGERIA E CRIPTOGRAFIA ASSIMÉTRICA
+BSI
+Disciplina: Sistemas Distribuídos
+Professora: Ana Cristina Barreiras Kochem Vendramin
+
+Aluno: Vitor Chiuco Zeni
+
+MS Gateway: menu do terminal para cadastrar, listar e votar em promoções.
+"""
+
 import pika
 import json
 import uuid
@@ -5,97 +16,105 @@ import sys
 import os
 import threading
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, project_root)
-os.chdir(project_root)
+# Permite importar o crypto_utils da raiz do projeto
+raiz_projeto = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, raiz_projeto)
+os.chdir(raiz_projeto)
 
 from crypto_utils import (carregar_chave_privada, carregar_chave_publica,
                           criar_evento, validar_evento, normalizar_categoria,
                           ROUTING_KEYS_RESERVADAS)
 
+# --- Configurações ---
 EXCHANGE = 'Promocoes'
-FILA_GATEWAY = 'Fila_Gateway'
+FILA = 'Fila_Gateway'
 
-chave_privada_gateway  = carregar_chave_privada('keys/gateway/private.pem')
+chave_privada_gateway = carregar_chave_privada('keys/gateway/private.pem')
 chave_publica_promocao = carregar_chave_publica('keys/promocao/public.pem')
 
-# Lista local de promoções validadas pelo MS Promoção: id -> dict
-promocoes_validadas = {}
-# Ordem de chegada, para permitir votar pelo número exibido na listagem
-ordem = []
+# --- Recursos compartilhados entre as threads ---
+promocoes_validadas = {}    # id -> promoção aprovada pelo MS Promoção
+ordem_chegada = []          # ids na ordem de chegada, para votar pelo número
 lock = threading.Lock()
 
-# ── Consumidor de promocao.publicada (thread em background) ──────────────────
+# --- Consumo de promocao.publicada (thread separada) ---
 
-def _on_publicada(ch, method, properties, body):
+def receber_publicada(ch, method, properties, body):
     try:
         try:
             evento = json.loads(body)
         except Exception:
-            print('\n[Gateway] Mensagem malformada (JSON inválido) — descartada.')
+            print('\n[Gateway] Mensagem com JSON inválido descartada.')
             return
 
-        # Valida a assinatura digital do MS Promoção antes de confiar no evento.
         promo, erro = validar_evento(evento, chave_publica_promocao)
         if erro:
-            print(f'\n[Gateway] Evento descartado — {erro}.')
+            print(f'\n[Gateway] Evento descartado: {erro}.')
             print('> ', end='', flush=True)
             return
 
         with lock:
             if promo['id'] not in promocoes_validadas:
-                ordem.append(promo['id'])
+                ordem_chegada.append(promo['id'])
             promocoes_validadas[promo['id']] = promo
+
         print(f'\n[Gateway] Promoção validada: "{promo["titulo"]}" [{promo["categoria"]}]')
         print('> ', end='', flush=True)
+
     except Exception as e:
         print(f'\n[Gateway] Erro ao processar evento: {e}')
 
+def consumir_publicadas():
+    conexao = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+    canal = conexao.channel()
+    canal.exchange_declare(exchange=EXCHANGE, exchange_type='topic')
 
-def _consumidor_thread():
-    conn = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
-    ch = conn.channel()
-    ch.exchange_declare(exchange=EXCHANGE, exchange_type='topic')
-
-    # Fila nomeada (conforme o diagrama do enunciado). Se já existir outra
-    # instância do Gateway usando "Fila_Gateway", cai para uma fila anônima
-    # exclusiva, de modo que os dois terminais recebam TODAS as promoções
-    # (e não metade cada um).
+    # Se outro Gateway já usa a Fila_Gateway, cria uma fila anônima
+    # para que os dois recebam todas as promoções
     try:
-        ch.queue_declare(queue=FILA_GATEWAY, exclusive=True)
-        fila = FILA_GATEWAY
+        canal.queue_declare(queue=FILA, exclusive=True)
+        fila = FILA
     except pika.exceptions.ChannelClosedByBroker:
-        ch = conn.channel()
-        ch.exchange_declare(exchange=EXCHANGE, exchange_type='topic')
-        fila = ch.queue_declare(queue='', exclusive=True).method.queue
+        canal = conexao.channel()
+        canal.exchange_declare(exchange=EXCHANGE, exchange_type='topic')
+        fila = canal.queue_declare(queue='', exclusive=True).method.queue
 
-    ch.queue_bind(exchange=EXCHANGE, queue=fila, routing_key='promocao.publicada')
-    ch.basic_consume(queue=fila, on_message_callback=_on_publicada, auto_ack=True)
-    ch.start_consuming()
+    canal.queue_bind(exchange=EXCHANGE, queue=fila, routing_key='promocao.publicada')
+    canal.basic_consume(queue=fila, on_message_callback=receber_publicada, auto_ack=True)
+    canal.start_consuming()
 
+# --- Publicação ---
 
-# ── Publicação ────────────────────────────────────────────────────────────────
-
-def _publicar(channel, routing_key, payload):
-    """Assina o payload com a chave privada do Gateway e publica o envelope."""
+def publicar(routing_key, payload):
+    """Assina e publica um evento. Retorna True se foi enviado ao broker."""
     evento = criar_evento(routing_key, payload, chave_privada_gateway)
-    channel.basic_publish(
-        exchange=EXCHANGE,
-        routing_key=routing_key,
-        body=json.dumps(evento),
-    )
 
+    # Abre uma conexão por publicação: uma conexão longa cairia por falta de
+    # heartbeat enquanto o menu fica parado no input()
+    try:
+        conexao = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+        try:
+            conexao.channel().basic_publish(exchange=EXCHANGE, routing_key=routing_key,
+                                            body=json.dumps(evento))
+        finally:
+            conexao.close()
+        return True
+    except pika.exceptions.AMQPError as e:
+        print(f'  [!] Falha ao publicar no RabbitMQ ({type(e).__name__}). Verifique o broker e tente novamente.')
+        return False
 
-# ── Ações do menu ─────────────────────────────────────────────────────────────
+# --- Ações do menu ---
 
-def _cadastrar_promocao(channel):
+def cadastrar_promocao():
     print('\n╔══════════════════════════════╗')
     print('║   CADASTRAR NOVA PROMOÇÃO    ║')
     print('╚══════════════════════════════╝')
-    titulo    = input('  Título     : ').strip()
+
+    titulo = input('  Título     : ').strip()
     if not titulo:
         print('  [!] O título é obrigatório.')
         return
+
     descricao = input('  Descrição  : ').strip()
     print('  Categorias sugeridas: livro, jogo, eletronico, roupa, esporte')
     categoria = normalizar_categoria(input('  Categoria  : '))
@@ -104,8 +123,9 @@ def _cadastrar_promocao(channel):
         print('  [!] Categoria inválida: não pode ser vazia nem uma das palavras')
         print(f'      reservadas do protocolo ({reservadas}).')
         return
+
     preco_str = input('  Preço (R$) : ').strip()
-    loja      = input('  Loja       : ').strip()
+    loja = input('  Loja       : ').strip()
 
     try:
         preco = float(preco_str.replace(',', '.'))
@@ -121,65 +141,70 @@ def _cadastrar_promocao(channel):
         'preco':     preco,
         'loja':      loja,
     }
-    _publicar(channel, 'promocao.recebida', payload)
+    if not publicar('promocao.recebida', payload):
+        return
+
     print(f'  [✓] Promoção enviada para validação! ID: {payload["id"]}')
     print(f'      (será notificada na routing key "promocao.{categoria}")')
 
-
-def _snapshot():
-    """Cópia consistente da lista local, na ordem de chegada."""
+def copiar_promocoes():
+    """Retorna uma cópia da lista de promoções validadas, na ordem de chegada."""
     with lock:
-        return [promocoes_validadas[i] for i in ordem if i in promocoes_validadas]
+        return [promocoes_validadas[i] for i in ordem_chegada if i in promocoes_validadas]
 
-
-def _listar_promocoes():
+def listar_promocoes():
     print('\n╔══════════════════════════════╗')
     print('║   PROMOÇÕES DISPONÍVEIS      ║')
     print('╚══════════════════════════════╝')
-    snap = _snapshot()
-    if not snap:
+
+    promocoes = copiar_promocoes()
+    if not promocoes:
         print('  Nenhuma promoção validada ainda.')
-        return snap
-    for i, p in enumerate(snap, 1):
-        preco = p.get('preco')
+        return promocoes
+
+    for i, promo in enumerate(promocoes, 1):
+        preco = promo.get('preco')
         preco_txt = f'R$ {preco:.2f}' if isinstance(preco, (int, float)) else 'preço n/d'
-        print(f'  {i}. [{p["categoria"].upper()}] {p["titulo"]}')
-        print(f'     {preco_txt}  |  {p.get("loja", "")}')
-        if p.get('descricao'):
-            print(f'     {p["descricao"]}')
-        print(f'     ID: {p["id"]}')
+        print(f'  {i}. [{promo["categoria"].upper()}] {promo["titulo"]}')
+        print(f'     {preco_txt}  |  {promo.get("loja", "")}')
+        if promo.get('descricao'):
+            print(f'     {promo["descricao"]}')
+        print(f'     ID: {promo["id"]}')
         print()
-    return snap
 
+    return promocoes
 
-def _votar_promocao(channel):
-    snap = _listar_promocoes()
-    if not snap:
+def votar_promocao():
+    promocoes = listar_promocoes()
+    if not promocoes:
         return
 
     print('╔══════════════════════════════╗')
     print('║      VOTAR EM PROMOÇÃO       ║')
     print('╚══════════════════════════════╝')
-    escolha = input('  Número da promoção (ou ID) : ').strip()
 
-    if escolha.isdigit() and 1 <= int(escolha) <= len(snap):
-        promo = snap[int(escolha) - 1]
+    # Aceita o número da listagem ou o ID completo
+    escolha = input('  Número da promoção (ou ID) : ').strip()
+    if escolha.isdigit() and 1 <= int(escolha) <= len(promocoes):
+        promo = promocoes[int(escolha) - 1]
     else:
         with lock:
             promo = promocoes_validadas.get(escolha)
+
     if promo is None:
         print('  [!] Promoção não encontrada.')
         return
 
-    voto_input = input('  Voto (p = positivo  /  n = negativo) : ').strip().lower()
-    if voto_input == 'p':
+    opcao_voto = input('  Voto (p = positivo  /  n = negativo) : ').strip().lower()
+    if opcao_voto == 'p':
         voto = 'positivo'
-    elif voto_input == 'n':
+    elif opcao_voto == 'n':
         voto = 'negativo'
     else:
         print('  [!] Entrada inválida.')
         return
 
+    # O voto leva os dados da promoção para o Ranking montar o destaque
     payload = {
         'promocao_id': promo['id'],
         'titulo':      promo['titulo'],
@@ -189,25 +214,24 @@ def _votar_promocao(channel):
         'loja':        promo.get('loja', ''),
         'voto':        voto,
     }
-    _publicar(channel, 'promocao.voto', payload)
+    if not publicar('promocao.voto', payload):
+        return
+
     print(f'  [✓] Voto "{voto}" registrado para "{promo["titulo"]}"!')
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
+# --- Função principal ---
 
 def main():
-    # Conexão de publicação (o consumo roda em thread/conexão separada,
-    # pois pika.BlockingConnection não é thread-safe)
-    conn_pub = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
-    ch_pub = conn_pub.channel()
-    ch_pub.exchange_declare(exchange=EXCHANGE, exchange_type='topic')
+    # Declara a exchange e já falha aqui se o broker estiver fora
+    conexao = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+    conexao.channel().exchange_declare(exchange=EXCHANGE, exchange_type='topic')
+    conexao.close()
 
-    # Thread consumidora em background
-    t = threading.Thread(target=_consumidor_thread, daemon=True)
-    t.start()
+    thread_consumo = threading.Thread(target=consumir_publicadas, daemon=True)
+    thread_consumo.start()
 
     print('╔══════════════════════════════════════╗')
-    print('║   SISTEMA DE PROMOÇÕES — GATEWAY     ║')
+    print('║   SISTEMA DE PROMOÇÕES - GATEWAY     ║')
     print('╚══════════════════════════════════════╝')
 
     while True:
@@ -221,18 +245,16 @@ def main():
             opcao = '0'
 
         if opcao == '1':
-            _cadastrar_promocao(ch_pub)
+            cadastrar_promocao()
         elif opcao == '2':
-            _listar_promocoes()
+            listar_promocoes()
         elif opcao == '3':
-            _votar_promocao(ch_pub)
+            votar_promocao()
         elif opcao == '0':
             print('Encerrando gateway...')
-            conn_pub.close()
             break
         else:
             print('  [!] Opção inválida.')
-
 
 if __name__ == '__main__':
     main()
